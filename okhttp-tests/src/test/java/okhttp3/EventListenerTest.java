@@ -17,6 +17,8 @@ package okhttp3;
 
 import java.io.IOException;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
 import java.net.UnknownHostException;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -25,15 +27,17 @@ import java.util.Collections;
 import java.util.Deque;
 import java.util.List;
 import okhttp3.internal.DoubleInetAddressDns;
+import okhttp3.internal.RecordingOkAuthenticator;
 import okhttp3.internal.SingleInetAddressDns;
 import okhttp3.internal.tls.SslClient;
 import okhttp3.mockwebserver.MockResponse;
 import okhttp3.mockwebserver.MockWebServer;
 import okhttp3.mockwebserver.SocketPolicy;
+import org.junit.After;
 import org.junit.Before;
-import org.junit.Rule;
 import org.junit.Test;
 
+import static okhttp3.TestUtil.defaultClient;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -43,18 +47,27 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public final class EventListenerTest {
-  @Rule public final MockWebServer server = new MockWebServer();
-
-  private OkHttpClient client;
+  private final MockWebServer server = new MockWebServer();
   private final SingleInetAddressDns singleDns = new SingleInetAddressDns();
   private final RecordingEventListener listener = new RecordingEventListener();
   private final SslClient sslClient = SslClient.localhost();
 
-  @Before public void setUp() {
-    client = new OkHttpClient.Builder()
+  private OkHttpClient client;
+  private SocksProxy socksProxy;
+
+  @Before public void setUp() throws IOException {
+    client = defaultClient().newBuilder()
         .dns(singleDns)
         .eventListener(listener)
         .build();
+    server.start();
+  }
+
+  @After public void tearDown() throws Exception {
+    server.shutdown();
+    if (socksProxy != null) {
+      socksProxy.shutdown();
+    }
   }
 
   @Test public void successfulCallEventSequence() throws IOException {
@@ -67,12 +80,14 @@ public final class EventListenerTest {
     assertEquals(200, response.code());
     response.body().close();
 
-    List<Class<?>> expectedEvents = Arrays.asList(DnsStart.class, DnsEnd.class);
+    List<Class<?>> expectedEvents = Arrays.asList(
+        DnsStart.class, DnsEnd.class,
+        ConnectStart.class, ConnectEnd.class);
     assertEquals(expectedEvents, listener.recordedEventTypes());
   }
 
   @Test public void successfulHttpsCallEventSequence() throws IOException {
-    enableTls(false);
+    enableTlsWithTunnel(false);
     server.enqueue(new MockResponse());
 
     Call call = client.newCall(new Request.Builder()
@@ -84,7 +99,8 @@ public final class EventListenerTest {
 
     List<Class<?>> expectedEvents = Arrays.asList(
         DnsStart.class, DnsEnd.class,
-        SecureConnectStart.class, SecureConnectEnd.class);
+        ConnectStart.class, SecureConnectStart.class,
+        SecureConnectEnd.class, ConnectEnd.class);
     assertEquals(expectedEvents, listener.recordedEventTypes());
   }
 
@@ -212,8 +228,178 @@ public final class EventListenerTest {
     assertTrue(dnsEnd.throwable instanceof UnknownHostException);
   }
 
+  @Test public void successfulConnect() throws IOException {
+    server.enqueue(new MockResponse());
+
+    Call call = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+    Response response = call.execute();
+    assertEquals(200, response.code());
+    response.body().close();
+
+    InetAddress address = singleDns.lookup(server.getHostName()).get(0);
+    InetSocketAddress expectedAddress = new InetSocketAddress(address, server.getPort());
+
+    ConnectStart connectStart = listener.removeUpToEvent(ConnectStart.class);
+    assertSame(call, connectStart.call);
+    assertEquals(expectedAddress, connectStart.inetSocketAddress);
+    assertNull(connectStart.proxy);
+
+    ConnectEnd connectEnd = listener.removeUpToEvent(ConnectEnd.class);
+    assertSame(call, connectEnd.call);
+    assertEquals(expectedAddress, connectEnd.inetSocketAddress);
+    assertEquals(Protocol.HTTP_1_1, connectEnd.protocol);
+    assertNull(connectEnd.throwable);
+  }
+
+  @Test public void failedConnect() throws UnknownHostException {
+    enableTlsWithTunnel(false);
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
+
+    Call call = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+    try {
+      call.execute();
+      fail();
+    } catch (IOException expected) {
+    }
+
+    InetAddress address = singleDns.lookup(server.getHostName()).get(0);
+    InetSocketAddress expectedAddress = new InetSocketAddress(address, server.getPort());
+
+    ConnectStart connectStart = listener.removeUpToEvent(ConnectStart.class);
+    assertSame(call, connectStart.call);
+    assertEquals(expectedAddress, connectStart.inetSocketAddress);
+
+    ConnectEnd connectEnd = listener.removeUpToEvent(ConnectEnd.class);
+    assertSame(call, connectEnd.call);
+    assertEquals(expectedAddress, connectEnd.inetSocketAddress);
+    assertNull(connectEnd.protocol);
+    assertTrue(connectEnd.throwable instanceof IOException);
+  }
+
+  @Test public void multipleConnectsForSingleCall() throws IOException {
+    enableTlsWithTunnel(false);
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
+    server.enqueue(new MockResponse());
+
+    client = client.newBuilder()
+        .dns(new DoubleInetAddressDns())
+        .build();
+
+    Call call = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+    Response response = call.execute();
+    assertEquals(200, response.code());
+    response.body().close();
+
+    listener.removeUpToEvent(ConnectStart.class);
+    listener.removeUpToEvent(ConnectEnd.class);
+    listener.removeUpToEvent(ConnectStart.class);
+    listener.removeUpToEvent(ConnectEnd.class);
+  }
+
+  @Test public void successfulHttpProxyConnect() throws IOException {
+    server.enqueue(new MockResponse());
+
+    client = client.newBuilder()
+        .proxy(server.toProxyAddress())
+        .build();
+
+    Call call = client.newCall(new Request.Builder()
+        .url("http://www.fakeurl")
+        .build());
+    Response response = call.execute();
+    assertEquals(200, response.code());
+    response.body().close();
+
+    InetAddress address = singleDns.lookup(server.getHostName()).get(0);
+    InetSocketAddress expectedAddress = new InetSocketAddress(address, server.getPort());
+
+    ConnectStart connectStart = listener.removeUpToEvent(ConnectStart.class);
+    assertSame(call, connectStart.call);
+    assertEquals(expectedAddress, connectStart.inetSocketAddress);
+    assertEquals(server.toProxyAddress(), connectStart.proxy);
+
+    ConnectEnd connectEnd = listener.removeUpToEvent(ConnectEnd.class);
+    assertSame(call, connectEnd.call);
+    assertEquals(expectedAddress, connectEnd.inetSocketAddress);
+    assertEquals(Protocol.HTTP_1_1, connectEnd.protocol);
+    assertNull(connectEnd.throwable);
+  }
+
+  @Test public void successfulSocksProxyConnect() throws Exception {
+    server.enqueue(new MockResponse());
+
+    socksProxy = new SocksProxy();
+    socksProxy.play();
+    Proxy proxy = socksProxy.proxy();
+
+    client = client.newBuilder()
+        .proxy(proxy)
+        .build();
+
+    Call call = client.newCall(new Request.Builder()
+        .url("http://" + SocksProxy.HOSTNAME_THAT_ONLY_THE_PROXY_KNOWS + ":" + server.getPort())
+        .build());
+    Response response = call.execute();
+    assertEquals(200, response.code());
+    response.body().close();
+
+    InetSocketAddress expectedAddress = InetSocketAddress.createUnresolved(
+        SocksProxy.HOSTNAME_THAT_ONLY_THE_PROXY_KNOWS, server.getPort());
+
+    ConnectStart connectStart = listener.removeUpToEvent(ConnectStart.class);
+    assertSame(call, connectStart.call);
+    assertEquals(expectedAddress, connectStart.inetSocketAddress);
+    assertEquals(proxy, connectStart.proxy);
+
+    ConnectEnd connectEnd = listener.removeUpToEvent(ConnectEnd.class);
+    assertSame(call, connectEnd.call);
+    assertEquals(expectedAddress, connectEnd.inetSocketAddress);
+    assertEquals(Protocol.HTTP_1_1, connectEnd.protocol);
+    assertNull(connectEnd.throwable);
+  }
+
+  @Test public void authenticatingTunnelProxyConnect() throws IOException {
+    enableTlsWithTunnel(true);
+    server.enqueue(new MockResponse()
+        .setResponseCode(407)
+        .addHeader("Proxy-Authenticate: Basic realm=\"localhost\"")
+        .addHeader("Connection: close"));
+    server.enqueue(new MockResponse()
+        .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END));
+    server.enqueue(new MockResponse());
+
+    client = client.newBuilder()
+        .proxy(server.toProxyAddress())
+        .proxyAuthenticator(new RecordingOkAuthenticator("password"))
+        .build();
+
+    Call call = client.newCall(new Request.Builder()
+        .url(server.url("/"))
+        .build());
+    Response response = call.execute();
+    assertEquals(200, response.code());
+    response.body().close();
+
+    listener.removeUpToEvent(ConnectStart.class);
+
+    ConnectEnd connectEnd = listener.removeUpToEvent(ConnectEnd.class);
+    assertNull(connectEnd.protocol);
+    assertNull(connectEnd.throwable);
+
+    listener.removeUpToEvent(ConnectStart.class);
+    listener.removeUpToEvent(ConnectEnd.class);
+  }
+
   @Test public void successfulSecureConnect() throws IOException {
-    enableTls(false);
+    enableTlsWithTunnel(false);
     server.enqueue(new MockResponse());
 
     Call call = client.newCall(new Request.Builder()
@@ -233,7 +419,7 @@ public final class EventListenerTest {
   }
 
   @Test public void failedSecureConnect() {
-    enableTls(false);
+    enableTlsWithTunnel(false);
     server.enqueue(new MockResponse()
         .setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
 
@@ -256,7 +442,7 @@ public final class EventListenerTest {
   }
 
   @Test public void secureConnectWithTunnel() throws IOException {
-    enableTls(true);
+    enableTlsWithTunnel(true);
     server.enqueue(new MockResponse()
         .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END));
     server.enqueue(new MockResponse());
@@ -282,7 +468,7 @@ public final class EventListenerTest {
   }
 
   @Test public void multipleSecureConnectsForSingleCall() throws IOException {
-    enableTls(false);
+    enableTlsWithTunnel(false);
     server.enqueue(new MockResponse()
         .setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
     server.enqueue(new MockResponse());
@@ -306,7 +492,7 @@ public final class EventListenerTest {
   }
 
   @Test public void noSecureConnectsOnPooledConnection() throws IOException {
-    enableTls(false);
+    enableTlsWithTunnel(false);
     server.enqueue(new MockResponse());
     server.enqueue(new MockResponse());
 
@@ -336,7 +522,7 @@ public final class EventListenerTest {
     assertFalse(recordedEvents.contains(SecureConnectEnd.class));
   }
 
-  private void enableTls(boolean tunnelProxy) {
+  private void enableTlsWithTunnel(boolean tunnelProxy) {
     client = client.newBuilder()
         .sslSocketFactory(sslClient.socketFactory, sslClient.trustManager)
         .hostnameVerifier(new RecordingHostnameVerifier())
@@ -364,6 +550,32 @@ public final class EventListenerTest {
       this.call = call;
       this.domainName = domainName;
       this.inetAddressList = inetAddressList;
+      this.throwable = throwable;
+    }
+  }
+
+  static final class ConnectStart {
+    final Call call;
+    final InetSocketAddress inetSocketAddress;
+    final Proxy proxy;
+
+    ConnectStart(Call call, InetSocketAddress inetSocketAddress, Proxy proxy) {
+      this.call = call;
+      this.inetSocketAddress = inetSocketAddress;
+      this.proxy = proxy;
+    }
+  }
+
+  static final class ConnectEnd {
+    final Call call;
+    final InetSocketAddress inetSocketAddress;
+    final Protocol protocol;
+    final Throwable throwable;
+
+    ConnectEnd(Call call, InetSocketAddress inetSocketAddress, Protocol protocol, Throwable throwable) {
+      this.call = call;
+      this.inetSocketAddress = inetSocketAddress;
+      this.protocol = protocol;
       this.throwable = throwable;
     }
   }
@@ -425,12 +637,22 @@ public final class EventListenerTest {
       eventSequence.offer(new DnsEnd(call, domainName, inetAddressList, throwable));
     }
 
+    @Override public void connectStart(Call call, InetSocketAddress inetSocketAddress,
+        Proxy proxy) {
+      eventSequence.offer(new ConnectStart(call, inetSocketAddress, proxy));
+    }
+
     @Override public void secureConnectStart(Call call) {
       eventSequence.offer(new SecureConnectStart(call));
     }
 
     @Override public void secureConnectEnd(Call call, Handshake handshake, Throwable throwable) {
       eventSequence.offer(new SecureConnectEnd(call, handshake, throwable));
+    }
+
+    @Override public void connectEnd(Call call, InetSocketAddress inetSocketAddress,
+        Protocol protocol, Throwable throwable) {
+      eventSequence.offer(new ConnectEnd(call, inetSocketAddress, protocol, throwable));
     }
   }
 }

@@ -16,6 +16,8 @@
 package okhttp3;
 
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
+import java.net.Proxy;
 import java.util.List;
 import javax.annotation.Nullable;
 
@@ -61,7 +63,18 @@ public abstract class EventListener {
       @Nullable Throwable throwable) {
   }
 
-  public void connectStart(Call call, InetAddress address, int port) {
+  /**
+   * Invoked just prior to initiating a socket connection.
+   *
+   * <p>This method will be invoked if no existing connection in the {@link ConnectionPool} can be
+   * reused.
+   *
+   * <p>This can be invoked more than 1 time for a single {@link Call}. For example, if the response
+   * to the {@link Call#request()} is a redirect to a different address, or a connection is retried.
+   *
+   * <p>{@code proxy} will be non-null if an HTTP or SOCKS proxy is used and null otherwise.
+   */
+  public void connectStart(Call call, InetSocketAddress inetSocketAddress, @Nullable Proxy proxy) {
   }
 
   /**
@@ -94,8 +107,21 @@ public abstract class EventListener {
       @Nullable Throwable throwable) {
   }
 
-  public void connectEnd(Call call,  InetAddress address, int port, String protocol,
-      Throwable throwable) {
+  /**
+   * Invoked immediately after a socket connection was attempted.
+   *
+   * <p>If the {@code call} uses HTTPS, this will be invoked after
+   * {@link #secureConnectEnd(Call, Handshake, Throwable)}, otherwise it will invoked after
+   * {@link #connectStart(Call, InetSocketAddress, Proxy)}.
+   *
+   * <p>{@code protocol} will be non-null and {@code throwable} will be null when the connection is
+   * successfully established.
+   *
+   * <p>{@code protocol} will be null and {@code throwable} will be non-null in the case of a failed
+   * connection attempt.
+   */
+  public void connectEnd(Call call, InetSocketAddress inetSocketAddress,
+      @Nullable Protocol protocol, @Nullable Throwable throwable) {
   }
 
   public void requestHeadersStart(Call call) {

@@ -41,7 +41,7 @@ import okio.Okio;
  * See <a href="https://www.ietf.org/rfc/rfc1928.txt">RFC 1928</a>.
  */
 public final class SocksProxy {
-  public final String HOSTNAME_THAT_ONLY_THE_PROXY_KNOWS = "onlyProxyCanResolveMe.org";
+  public static final String HOSTNAME_THAT_ONLY_THE_PROXY_KNOWS = "onlyProxyCanResolveMe.org";
 
   private static final int VERSION_5 = 5;
   private static final int METHOD_NONE = 0xff;
